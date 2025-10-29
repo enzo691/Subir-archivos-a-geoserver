@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <title>Subir múltiples GPKG sin WMS</title>
+</head>
+<body>
+  <h2>Subir varios .gpkg a GeoServer sin publicar WMS</h2>
+
+  <form id="formulario">
+    <label for="archivos">Archivos .gpkg:</label>
+    <input type="file" id="archivos" accept=".gpkg" multiple required aria-describedby="archivosHelp" />
+    <div id="archivosHelp" style="font-size:0.9em;margin-bottom:8px;color:#555">Selecciona uno o varios archivos .gpkg</div>
+
+    <label for="workspace">Workspace:</label>
+    <input type="text" id="workspace" required placeholder="Nombre del workspace en GeoServer" />
+
+    <label for="store">Nombre del Store (preview):</label>
+    <input type="text" id="store" placeholder="Se usará el nombre de cada archivo" readonly /><br /><br />
+
+    <label for="rutaDataDir">Ruta en data_dir (carpeta interna):</label>
+    <input type="text" id="rutaDataDir" value="Munirawson/archivos" required />
+
+    <label for="url">GeoServer URL:</label>
+    <input type="text" id="url" placeholder="http://host:port/geoserver" required />
+
+    <label for="usuario">Usuario:</label>
+    <input type="text" id="usuario" placeholder="usuario (no lo guardes en archivos)" required />
+
+    <label for="clave">Contraseña:</label>
+    <input type="password" id="clave" placeholder="contraseña" required />
+
+    <button type="submit">Subir todos</button>
+  </form>
+
+  <pre id="log" style="background:#eee; padding:10px; margin-top:20px; white-space: pre-wrap;" role="status" aria-live="polite"></pre>
+
+  <script>
+    document.getElementById('formulario').addEventListener('submit', async function (e) {
+      e.preventDefault();
+      const log = document.getElementById('log');
+      log.textContent = '⏳ Procesando...\n';
+
+  const archivos = document.getElementById('archivos').files;
+  const rawUrl = document.getElementById('url').value;
+      // Normalizar URL base: eliminar '/web' u otros sufijos y slash final
+      function normalizeBase(raw) {
+        if (!raw) return raw;
+        // Quitar querystring
+        const noQuery = raw.split('?')[0];
+        return noQuery.replace(/\/web(\/.*)?$/i, '').replace(/\/$/, '');
+      }
+      const url = normalizeBase(rawUrl);
+      const usuario = document.getElementById('usuario').value;
+      const clave = document.getElementById('clave').value;
+      const auth = 'Basic ' + btoa(`${usuario}:${clave}`);
+
+      // Helpers para sanitizar y codificar rutas/pedidos REST
+      function sanitizeSegment(s) {
+        return String(s).replace(/\\s+/g, '_').replace(/\.\.+/g, '').replace(/[^a-zA-Z0-9_\-\.]/g, '');
+      }
+
+      function encodePathSegments(path) {
+        return path.split('/').map(seg => encodeURIComponent(seg)).join('/');
+      }
+
+      // Crear carpeta en data_dir (sanitizando segmentos)
+      const rutaBaseRaw = document.getElementById('rutaDataDir').value || '';
+      const rutaBase = rutaBaseRaw.split('/').map(sanitizeSegment).filter(Boolean).join('/');
+
+      try {
+        const crearCarpeta = await fetch(`${url}/rest/resource/${encodePathSegments(rutaBase)}`, {
+          method: 'POST',
+          headers: {
+            'Authorization': auth,
+            'Content-Type': 'application/xml'
+          },
+          body: '<directory/>'
+        });
+
+        if (crearCarpeta.ok || crearCarpeta.status === 405 || crearCarpeta.status === 409) {
+          log.textContent += `📂 Carpeta '${rutaBase}' lista en el data_dir\n`;
+        } else {
+          const t = await crearCarpeta.text();
+          throw new Error(`Error al crear carpeta: ${crearCarpeta.status} ${t}`);
+        }
+      } catch (err) {
+        log.textContent += `❌ No se pudo crear la carpeta: ${err.message}\n`;
+        // Posible causa: CORS o URL mal formada
+        log.textContent += `❗ Comprueba que la URL base sea algo como 'http://host:port/geoserver' y que GeoServer permita CORS o que ejecutes desde el mismo origen.\n`;
+        return;
+      }
+
+      // Función para verificar/crear workspace si hace falta
+      async function ensureWorkspace(ws) {
+        const wsEnc = encodeURIComponent(ws);
+        const check = await fetch(`${url}/rest/workspaces/${wsEnc}`, {
+          method: 'GET',
+          headers: { 'Authorization': auth, 'Accept': 'application/xml' }
+        });
+        if (check.ok) return true;
+        if (check.status === 404) {
+          const body = `<workspace><name>${ws}</name></workspace>`;
+          const crear = await fetch(`${url}/rest/workspaces`, {
+            method: 'POST',
+            headers: { 'Authorization': auth, 'Content-Type': 'application/xml' },
+            body
+          });
+          return crear.ok;
+        }
+        // otros errores
+        const t = await check.text();
+        throw new Error(`Error verificando workspace: ${check.status} ${t}`);
+      }
+
+      // Procesar cada archivo
+      // Comprobar/crear workspace antes de procesar archivos
+      const workspace = document.getElementById('workspace').value;
+      try {
+        const okWs = await ensureWorkspace(workspace);
+        if (!okWs) {
+          log.textContent += `❌ No se pudo crear/verificar workspace '${workspace}'\n`;
+          return;
+        } else {
+          log.textContent += `📁 Workspace '${workspace}' verificado/creado\n`;
+        }
+      } catch (err) {
+        log.textContent += `❌ Error workspace: ${err.message}\n`;
+        return;
+      }
+
+      for (const archivo of archivos) {
+        try {
+          // Sanitizar nombre de archivo y construir ruta segura
+          const safeName = sanitizeSegment(archivo.name.replace(/\.gpkg$/i, '')) + archivo.name.match(/\.gpkg$/i) ? '.gpkg' : '';
+          const rutaCompleta = `${rutaBase}/${safeName}`;
+
+          // Subir archivo
+          const subir = await fetch(`${url}/rest/resource/${encodePathSegments(rutaCompleta)}`, {
+            method: 'PUT',
+            headers: {
+              'Authorization': auth,
+              'Content-Type': 'application/octet-stream'
+            },
+            body: archivo
+          });
+
+          if (!subir.ok) {
+            const texto = await subir.text();
+            log.textContent += `❌ ${archivo.name} (Error ${subir.status}): ${texto}\n`;
+            continue;
+          }
+
+          log.textContent += `✅ ${archivo.name} subido a ${rutaCompleta}\n`;
+
+          // Verificar si datastore existe
+          const storeNameRaw = archivo.name.replace(/\.gpkg$/i, '');
+          const storeName = sanitizeSegment(storeNameRaw);
+
+          // actualizar preview
+          const storeInput = document.getElementById('store');
+          if (storeInput) storeInput.value = storeName;
+
+          const dsUrl = `${url}/rest/workspaces/${encodeURIComponent(workspace)}/datastores/${encodeURIComponent(storeName)}`;
+          const checkStore = await fetch(dsUrl, {
+            method: 'GET',
+            headers: {
+              'Authorization': auth,
+              'Accept': 'application/xml'
+            }
+          });
+
+          if (checkStore.ok) {
+            log.textContent += `ℹ️ Store '${storeName}' ya existe, se omite creación\n`;
+          } else if (checkStore.status === 404) {
+            // Crear datastore
+            const body = `
+              <dataStore>
+                <name>${storeName}</name>
+                <connectionParameters>
+                  <entry key="dbtype">geopkg</entry>
+                  <entry key="database">file:${rutaCompleta}</entry>
+                </connectionParameters>
+              </dataStore>
+            `;
+
+            const crearStore = await fetch(`${url}/rest/workspaces/${encodeURIComponent(workspace)}/datastores`, {
+              method: 'POST',
+              headers: {
+                'Authorization': auth,
+                'Content-Type': 'application/xml'
+              },
+              body
+            });
+
+            if (crearStore.ok) {
+              log.textContent += `📦 Store '${storeName}' creado correctamente\n`;
+            } else {
+              const texto = await crearStore.text();
+              log.textContent += `❌ Error creando store '${storeName}': ${crearStore.status} ${texto}\n`;
+            }
+          } else {
+            const texto = await checkStore.text();
+            log.textContent += `❌ Error verificando store '${storeName}': ${checkStore.status} ${texto}\n`;
+          }
+
+        } catch (err) {
+          log.textContent += `❌ ${archivo.name}: error ${err.message}\n`;
+        }
+      }
+
+      log.textContent += `🎯 Procesamiento finalizado. No se publicaron capas WMS automáticamente.\n`;
+    });
+  </script>
+</body>
+</html>
